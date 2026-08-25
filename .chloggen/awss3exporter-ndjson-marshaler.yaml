@@ -20,6 +20,11 @@ subtext: |
   collision the more specific level wins (record over scope over resource). Span events and links, and sum
   temporality and monotonicity, are not preserved.
 
+  A log body is routed by its type to exactly one field, so each key holds a stable JSON type: a string, int,
+  double, bool or bytes body becomes `message`, a kvlist becomes `body`, and an array becomes `array`. Nulls are
+  stripped recursively from those fields and from attributes, along with any container left empty by the
+  stripping, so a null never appears in a line. Zero values are kept.
+
 # If your change doesn't affect end users or the exported elements of any package,
 # you should instead start your pull request title with [chore] or use the "Skip Changelog" label.
 # Optional: The change log or logs in which this entry should be included.
