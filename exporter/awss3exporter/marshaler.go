@@ -64,6 +64,15 @@ func newMarshaler(mType MarshalerType, logger *zap.Logger) (marshaler, error) {
 		marshaler.logsMarshaler = &exportbodyMarshaler
 		marshaler.fileFormat = exportbodyMarshaler.format()
 		marshaler.IsCompressed = false
+	case NDJSON:
+		ndjsonmarshaler := newNdjsonMarshaler()
+		// All three signals must be set: s3Marshaler dereferences these
+		// without a nil check, so an unset field panics on that signal.
+		marshaler.logsMarshaler = &ndjsonmarshaler
+		marshaler.metricsMarshaler = &ndjsonmarshaler
+		marshaler.tracesMarshaler = &ndjsonmarshaler
+		marshaler.fileFormat = ndjsonmarshaler.format()
+		marshaler.IsCompressed = false
 	default:
 		return nil, ErrUnknownMarshaler
 	}

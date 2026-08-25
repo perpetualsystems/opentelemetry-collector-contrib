@@ -44,6 +44,12 @@ func TestMarshaler(t *testing.T) {
 		require.NotNil(t, m)
 		assert.Equal(t, "txt", m.format())
 	}
+	{
+		m, err := newMarshaler("ndjson", zap.NewNop())
+		assert.NoError(t, err)
+		require.NotNil(t, m)
+		assert.Equal(t, "jsonl", m.format())
+	}
 }
 
 type hostWithExtensions struct {
