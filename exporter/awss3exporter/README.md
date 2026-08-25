@@ -73,6 +73,35 @@ Marshaler determines the format of data sent to AWS S3. Currently, the following
   **This format is supported only for logs.**
 - `body`: export the log body as string.
   **This format is supported only for logs.**
+- `ndjson`: newline delimited JSON — one JSON object per line, written to objects with a `.jsonl` extension.
+
+  Each line is self contained: resource and scope attributes are flattened onto every log record, metric data point
+  and span, so a consumer never has to walk back up the OTLP envelope. On a key collision the more specific level
+  wins (record over scope over resource). Attribute values keep their native JSON types rather than being
+  stringified.
+
+  ```json
+  {"timeUnixNano":"1787617744022570766","body":"IngestJob completed","attributes":{"k8s.namespace.name":"simba"}}
+  {"name":"container_cpu_usage_seconds_total","type":"sum","timeUnixNano":"1787617817596000000","value":19,"attributes":{"container":"df-ingest"}}
+  {"traceId":"5b8efff798038103d269b633813fc60c","spanId":"eee19b7ec3c1b174","name":"GET /api","kind":"server","status":{"code":"ok"},"attributes":{}}
+  ```
+
+  Log lines carry `timeUnixNano` (falling back to the observed timestamp when the record has none), `body` and
+  `attributes`. Metric lines carry the metric's `name`, `description`, `unit` and `type` alongside the data point's
+  timestamps, `value` (gauges and sums) or `count`/`sum`/`min`/`max`/`bucketCounts`/`explicitBounds`/`quantileValues`
+  (histograms and summaries). Span lines carry `traceId`, `spanId`, `parentSpanId`, `name`, `kind`, both timestamps
+  and `status`. Fields that are unset are omitted from the line entirely.
+
+  Three things are deliberately not preserved:
+
+  - Span events and links are dropped.
+  - Sum `aggregationTemporality` and `isMonotonic` are not emitted, so a delta counter is indistinguishable from a
+    cumulative one.
+  - Enums use lowercase short forms (`server`, `ok`, `sum`) rather than OTLP/JSON's `SPAN_KIND_SERVER` spelling.
+
+  Timestamps are rendered as strings because nanosecond values exceed 2^53; integer attribute and metric values are
+  rendered as JSON numbers, so consumers that parse JSON numbers as doubles will lose precision above that same
+  threshold.
 
 ### Encoding
 
