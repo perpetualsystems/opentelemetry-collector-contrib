@@ -81,13 +81,34 @@ Marshaler determines the format of data sent to AWS S3. Currently, the following
   stringified.
 
   ```json
-  {"timeUnixNano":"1787617744022570766","body":"IngestJob completed","attributes":{"k8s.namespace.name":"simba"}}
+  {"timeUnixNano":"1787617744022570766","message":"IngestJob completed","attributes":{"k8s.namespace.name":"simba"}}
+  {"timeUnixNano":"1787617744022570766","body":{"reason":"RemovingNode","type":"Normal"},"attributes":{"simba.sh/source":"k8s-events"}}
   {"name":"container_cpu_usage_seconds_total","type":"sum","timeUnixNano":"1787617817596000000","value":19,"attributes":{"container":"df-ingest"}}
   {"traceId":"5b8efff798038103d269b633813fc60c","spanId":"eee19b7ec3c1b174","name":"GET /api","kind":"server","status":{"code":"ok"},"attributes":{}}
   ```
 
-  Log lines carry `timeUnixNano` (falling back to the observed timestamp when the record has none), `body` and
-  `attributes`. Metric lines carry the metric's `name`, `description`, `unit` and `type` alongside the data point's
+  Log lines carry `timeUnixNano` (falling back to the observed timestamp when the record has none), `attributes`, and
+  exactly one payload field chosen by the type of the log body:
+
+  | body type | field | JSON type |
+  |---|---|---|
+  | string, int, double, bool, bytes | `message` | string (bytes are base64) |
+  | kvlist | `body` | object |
+  | array | `array` | array |
+  | unset | none | — |
+
+  Which key is present is the discriminator, and each key always holds the same JSON type, so a consumer can branch on
+  the key without a runtime type check and the archive can be read with a fixed schema. There is no `message_type`
+  field.
+
+  Nulls are stripped recursively from `body`, `array` and `attributes`: a null never appears in a line. OTLP cannot
+  express "absent" inside a kvlist, so an entry with an unset value would otherwise be written as a JSON null. Those
+  keys are dropped, and any object or array left empty by that dropping is dropped in turn, bottom up — a Kubernetes
+  object's `fieldsV1` subtree, whose leaves are all empty, disappears entirely. A container that arrived empty is
+  dropped just the same, so an explicit `"labels":{}` does not survive. Zero values are data and are kept: `0`, `false`
+  and `""` all remain. If the whole body strips to nothing, no payload field is emitted.
+
+  Metric lines carry the metric's `name`, `description`, `unit` and `type` alongside the data point's
   timestamps, `value` (gauges and sums) or `count`/`sum`/`min`/`max`/`bucketCounts`/`explicitBounds`/`quantileValues`
   (histograms and summaries). Span lines carry `traceId`, `spanId`, `parentSpanId`, `name`, `kind`, both timestamps
   and `status`. Fields that are unset are omitted from the line entirely.
@@ -98,6 +119,8 @@ Marshaler determines the format of data sent to AWS S3. Currently, the following
   - Sum `aggregationTemporality` and `isMonotonic` are not emitted, so a delta counter is indistinguishable from a
     cumulative one.
   - Enums use lowercase short forms (`server`, `ok`, `sum`) rather than OTLP/JSON's `SPAN_KIND_SERVER` spelling.
+  - Array indices are not positionally stable: stripping an absent element shortens the array, so index-aligned
+    parallel arrays in a log body will desynchronize.
 
   Timestamps are rendered as strings because nanosecond values exceed 2^53; integer attribute and metric values are
   rendered as JSON numbers, so consumers that parse JSON numbers as doubles will lose precision above that same

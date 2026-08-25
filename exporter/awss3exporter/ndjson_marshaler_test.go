@@ -34,7 +34,7 @@ func TestNdjsonMarshalLogs(t *testing.T) {
 	out, err := ndjsonMarshaler{}.MarshalLogs(logs)
 	require.NoError(t, err)
 	assert.Equal(t,
-		`{"timeUnixNano":"1787617744022570766","body":"IngestJob completed successfully",`+
+		`{"timeUnixNano":"1787617744022570766","message":"IngestJob completed successfully",`+
 			`"attributes":{"k8s.namespace.name":"simba","log.iostream":"stdout"}}`+"\n",
 		string(out))
 }
@@ -177,7 +177,7 @@ func TestNdjsonLogOmitsAbsentFields(t *testing.T) {
 	lr.Body().SetStr("bare")
 
 	// No timestamps and no attributes at any level: both keys disappear.
-	assert.Equal(t, `{"body":"bare"}`+"\n", marshalLogs(t, logs))
+	assert.Equal(t, `{"message":"bare"}`+"\n", marshalLogs(t, logs))
 }
 
 // TestNdjsonMetricZeroValueRetained is the omitempty regression guard: 0 is a
@@ -469,4 +469,202 @@ func unmarshalLine(t *testing.T, line string) map[string]any {
 	var record map[string]any
 	require.NoError(t, json.Unmarshal([]byte(line), &record))
 	return record
+}
+
+// TestNdjsonLogBodyRouting pins the whole discriminator contract: which key a
+// body type lands in, and that exactly one of the three is ever present.
+func TestNdjsonLogBodyRouting(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(pcommon.Value)
+		want string // empty means no payload key at all
+	}{
+		{"str", func(v pcommon.Value) { v.SetStr("hello") }, `"message":"hello"`},
+		{"int", func(v pcommon.Value) { v.SetInt(42) }, `"message":"42"`},
+		{"double", func(v pcommon.Value) { v.SetDouble(1.5) }, `"message":"1.5"`},
+		{"bool", func(v pcommon.Value) { v.SetBool(true) }, `"message":"true"`},
+		{"bytes", func(v pcommon.Value) { v.SetEmptyBytes().FromRaw([]byte{0x01, 0x02}) }, `"message":"AQI="`},
+		{"map", func(v pcommon.Value) { v.SetEmptyMap().PutStr("k", "v") }, `"body":{"k":"v"}`},
+		{"slice", func(v pcommon.Value) { v.SetEmptySlice().AppendEmpty().SetStr("a") }, `"array":["a"]`},
+		{"empty", func(pcommon.Value) {}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := plog.NewLogs()
+			lr := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+			lr.SetTimestamp(pcommon.Timestamp(1787617744022570766))
+			tc.set(lr.Body())
+
+			line := marshalLogsToLine(t, logs)
+			record := unmarshalLine(t, line)
+			present := 0
+			for _, k := range []string{"message", "body", "array"} {
+				if _, ok := record[k]; ok {
+					present++
+				}
+			}
+			if tc.want == "" {
+				assert.Zero(t, present, "an unset body must set no payload key")
+				return
+			}
+			assert.Equal(t, 1, present, "exactly one payload key: it is the discriminator")
+			assert.Contains(t, line, tc.want)
+		})
+	}
+}
+
+func TestNdjsonLogEmptyStringBodyOmitsMessage(t *testing.T) {
+	logs := plog.NewLogs()
+	lr := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	lr.SetTimestamp(pcommon.Timestamp(1787617744022570766))
+	lr.Body().SetStr("")
+
+	assert.Equal(t, `{"timeUnixNano":"1787617744022570766"}`+"\n", marshalLogs(t, logs))
+}
+
+// TestNdjsonLogBodyStripsUnsetAndEmptyContainers is shaped like a k8sobjects
+// Event: a managedFields entry whose fieldsV1 tree is nothing but empty
+// containers, alongside fields the API server left unset and fields whose value
+// is a legitimate zero.
+func TestNdjsonLogBodyStripsUnsetAndEmptyContainers(t *testing.T) {
+	logs := plog.NewLogs()
+	lr := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+
+	body := lr.Body().SetEmptyMap()
+	body.PutStr("reason", "RemovingNode")
+	body.PutInt("deprecatedCount", 0)
+	body.PutBool("deprecated", false)
+	body.PutStr("note", "")
+	body.PutEmpty("eventTime")
+	metadata := body.PutEmptyMap("metadata")
+	metadata.PutStr("name", "ip-10-50-93-165.18cf1e781a22030c")
+	metadata.PutEmpty("deletionTimestamp")
+	entry := metadata.PutEmptySlice("managedFields").AppendEmpty().SetEmptyMap()
+	entry.PutStr("manager", "kube-controller-manager")
+	entry.PutStr("operation", "Update")
+	fields := entry.PutEmptyMap("fieldsV1")
+	// The real exports use empty kvlists here rather than unset values, so this
+	// subtree collapses on the empty-container rule, not the null rule.
+	fields.PutEmptyMap("f:involvedObject")
+	fields.PutEmptyMap("f:reason")
+	fields.PutEmptyMap("f:source").PutEmptyMap("f:component")
+
+	line := marshalLogsToLine(t, logs)
+	assert.NotContains(t, line, "null", "no null may reach the output")
+	assert.NotContains(t, line, "{}", "no empty object may reach the output")
+
+	got, ok := unmarshalLine(t, line)["body"].(map[string]any)
+	require.True(t, ok, "a kvlist body must land in body")
+
+	assert.Equal(t, "RemovingNode", got["reason"])
+	// Zero values are data, not absence.
+	assert.InDelta(t, float64(0), got["deprecatedCount"], 0)
+	assert.Equal(t, false, got["deprecated"])
+	assert.Empty(t, got["note"], "an empty string is data, not absence")
+	assert.NotContains(t, got, "eventTime")
+
+	metadataGot := got["metadata"].(map[string]any)
+	assert.Equal(t, "ip-10-50-93-165.18cf1e781a22030c", metadataGot["name"])
+	assert.NotContains(t, metadataGot, "deletionTimestamp")
+
+	managed := metadataGot["managedFields"].([]any)
+	require.Len(t, managed, 1)
+	entryGot := managed[0].(map[string]any)
+	assert.Equal(t, "kube-controller-manager", entryGot["manager"])
+	assert.NotContains(t, entryGot, "fieldsV1", "every leaf was empty, so the subtree collapses bottom up")
+}
+
+func TestNdjsonLogBodyStrippedToNothingOmitsKey(t *testing.T) {
+	logs := plog.NewLogs()
+	lr := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	body := lr.Body().SetEmptyMap()
+	body.PutEmpty("a")
+	body.PutEmptyMap("b").PutEmptySlice("c")
+
+	assert.Equal(t, "{}\n", marshalLogs(t, logs))
+}
+
+func TestNdjsonLogArrayStripsAbsentElements(t *testing.T) {
+	logs := plog.NewLogs()
+	lr := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	s := lr.Body().SetEmptySlice()
+	s.AppendEmpty().SetStr("a")
+	s.AppendEmpty()           // unset
+	s.AppendEmpty().SetInt(0) // a zero, which must survive
+	s.AppendEmpty().SetEmptyMap()
+
+	assert.Contains(t, marshalLogsToLine(t, logs), `"array":["a",0]`)
+}
+
+func TestNdjsonLogAllAbsentArrayOmitsKey(t *testing.T) {
+	logs := plog.NewLogs()
+	lr := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	s := lr.Body().SetEmptySlice()
+	s.AppendEmpty()
+	s.AppendEmpty()
+
+	assert.Equal(t, "{}\n", marshalLogs(t, logs))
+}
+
+// TestNdjsonLogBodyDeepNesting guards the bottom-up ordering: a chain survives
+// only if something at the bottom of it does.
+func TestNdjsonLogBodyDeepNesting(t *testing.T) {
+	t.Run("SurvivesWhenLeafHasValue", func(t *testing.T) {
+		logs := plog.NewLogs()
+		lr := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+		lr.Body().SetEmptyMap().PutEmptyMap("a").PutEmptyMap("b").PutEmptyMap("c").PutStr("d", "deep")
+
+		assert.Contains(t, marshalLogsToLine(t, logs), `"body":{"a":{"b":{"c":{"d":"deep"}}}}`)
+	})
+
+	t.Run("CollapsesWhenLeafIsEmpty", func(t *testing.T) {
+		logs := plog.NewLogs()
+		lr := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+		lr.Body().SetEmptyMap().PutEmptyMap("a").PutEmptyMap("b").PutEmptyMap("c").PutEmptyMap("d")
+
+		assert.Equal(t, "{}\n", marshalLogs(t, logs))
+	})
+}
+
+// TestNdjsonLogStripDoesNotMutatePdata covers the strip specifically: it is the
+// only part of this marshaler that mutates anything, and it must only ever
+// mutate the fresh maps AsRaw hands back.
+func TestNdjsonLogStripDoesNotMutatePdata(t *testing.T) {
+	logs := plog.NewLogs()
+	lr := logs.ResourceLogs().AppendEmpty().ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	body := lr.Body().SetEmptyMap()
+	body.PutStr("keep", "yes")
+	body.PutEmpty("drop")
+	body.PutEmptyMap("nested").PutEmpty("deep")
+
+	before := lr.Body().AsRaw()
+	_, err := ndjsonMarshaler{}.MarshalLogs(logs)
+	require.NoError(t, err)
+
+	assert.Equal(t, before, lr.Body().AsRaw(), "the source body must be untouched")
+	assert.Contains(t, before, "drop", "the snapshot itself must still hold the stripped key")
+}
+
+func TestNdjsonAttributesStripped(t *testing.T) {
+	logs := plog.NewLogs()
+	rl := logs.ResourceLogs().AppendEmpty()
+	rl.Resource().Attributes().PutStr("kept", "resource")
+	rl.Resource().Attributes().PutEmpty("resource.unset")
+	rl.Resource().Attributes().PutEmptyMap("resource.empty")
+	lr := rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
+	lr.Body().SetStr("x")
+	lr.Attributes().PutStr("record.set", "yes")
+	lr.Attributes().PutEmpty("record.unset")
+	// An unset record attribute must not shadow the resource attribute it would
+	// otherwise overwrite.
+	lr.Attributes().PutEmpty("kept")
+
+	line := marshalLogsToLine(t, logs)
+	assert.NotContains(t, line, "null")
+
+	attrs := unmarshalLine(t, line)["attributes"].(map[string]any)
+	assert.Equal(t, "resource", attrs["kept"])
+	assert.Equal(t, "yes", attrs["record.set"])
+	assert.NotContains(t, attrs, "resource.unset")
+	assert.NotContains(t, attrs, "resource.empty")
+	assert.NotContains(t, attrs, "record.unset")
 }

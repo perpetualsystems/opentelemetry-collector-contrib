@@ -47,10 +47,21 @@ func (ndjsonMarshaler) format() string {
 // `any`, omitempty tests for nil rather than for the zero value, so a
 // value of 0 is still emitted. Do not replace these with omitzero, which would
 // drop a genuine `"value":0` or `"count":0`.
+//
+// ndjsonLogRecord.Message is the deliberate exception: it is a plain string,
+// because the body has already been rendered to text and so has no zero value
+// to protect. An int body of 0 renders as "0" and survives; only a genuinely
+// empty string body is dropped, which is the intent.
 
+// ndjsonLogRecord carries exactly one of Message, Body or Array, chosen by the
+// type of the log body. Which key is present is the discriminator, and the
+// concrete field types keep each key's JSON type stable across every line, so
+// the archive can be read with a fixed schema.
 type ndjsonLogRecord struct {
 	TimeUnixNano string         `json:"timeUnixNano,omitempty"`
-	Body         any            `json:"body,omitempty"`
+	Message      string         `json:"message,omitempty"`
+	Body         map[string]any `json:"body,omitempty"`
+	Array        []any          `json:"array,omitempty"`
 	Attributes   map[string]any `json:"attributes,omitempty"`
 }
 
@@ -130,6 +141,11 @@ func newNdjsonEncoder(buf *bytes.Buffer) *json.Encoder {
 // conflicting keys. The input pdata is only read: pcommon.Value.AsRaw
 // allocates fresh Go values, so nothing is mutated or aliased back into the
 // pipeline's data.
+//
+// Overlay values are stripped as they are inserted, and an absent one is
+// skipped rather than written: an unset attribute carries no information, so it
+// must not shadow the resource attribute of the same name that it would
+// otherwise overwrite.
 func mergeAttributes(base map[string]any, overlay pcommon.Map) map[string]any {
 	if overlay.Len() == 0 {
 		// Safe to alias: the result is only ever JSON encoded, never written to.
@@ -138,9 +154,121 @@ func mergeAttributes(base map[string]any, overlay pcommon.Map) map[string]any {
 	out := make(map[string]any, len(base)+overlay.Len())
 	maps.Copy(out, base)
 	for k, v := range overlay.All() {
-		out[k] = v.AsRaw()
+		raw := ndjsonStripValue(v.AsRaw())
+		if ndjsonIsAbsent(raw) {
+			continue
+		}
+		out[k] = raw
 	}
 	return out
+}
+
+// ndjsonResourceAttributes renders a resource's attributes once per resource.
+// The result is aliased by mergeAttributes for every record underneath, so
+// stripping it here strips it for all of them.
+func ndjsonResourceAttributes(res pcommon.Resource) map[string]any {
+	attrs := res.Attributes().AsRaw()
+	ndjsonStripMap(attrs)
+	return attrs
+}
+
+// ndjsonLogBody routes a log body to exactly one of the three payload fields.
+// An unset body sets none of them.
+//
+// Scalars go through Value.AsString, which renders a string verbatim, numbers
+// and bools as text, and bytes as base64. That also renders a non-finite double
+// as "NaN" or "Infinity" rather than failing the encode, which is what the
+// metric path has to guard against separately: a log line saying NaN is
+// information, whereas a metric with no value is noise.
+//
+// Maps and slices are stripped first. OTLP cannot express "absent" inside a
+// kvlist, so an unset entry arrives from AsRaw as a nil that would otherwise be
+// written as a JSON null.
+func ndjsonLogBody(v pcommon.Value) (message string, body map[string]any, array []any) {
+	switch v.Type() {
+	case pcommon.ValueTypeEmpty:
+		return "", nil, nil
+	case pcommon.ValueTypeMap:
+		m := v.Map().AsRaw()
+		ndjsonStripMap(m)
+		return "", m, nil
+	case pcommon.ValueTypeSlice:
+		return "", nil, ndjsonStripSlice(v.Slice().AsRaw())
+	default:
+		// Str, Int, Double, Bool, Bytes, and any scalar pdata adds later.
+		return v.AsString(), nil, nil
+	}
+}
+
+// ndjsonStripMap deletes every key whose value carries no information. It
+// recurses before testing, so a nested container that the strip empties is
+// itself deleted, bottom up: a Kubernetes object's fieldsV1 subtree, whose
+// leaves are all empty, disappears entirely.
+//
+// The map comes from AsRaw, which allocates fresh at every nesting level, so
+// mutating it in place cannot reach the pipeline's data. Deleting during a
+// range is defined behavior and the deleted key is not revisited.
+func ndjsonStripMap(m map[string]any) {
+	for k, v := range m {
+		v = ndjsonStripValue(v)
+		if ndjsonIsAbsent(v) {
+			delete(m, k)
+			continue
+		}
+		m[k] = v
+	}
+}
+
+// ndjsonStripSlice filters in place, which is why it must return: dropping an
+// element shortens the slice. The write index never overtakes the read index,
+// so it only ever overwrites elements already copied out.
+//
+// Dropping an element shifts those after it, so array indices are not
+// positionally stable. See the ndjson section of README.md.
+func ndjsonStripSlice(s []any) []any {
+	out := s[:0]
+	for _, v := range s {
+		v = ndjsonStripValue(v)
+		if ndjsonIsAbsent(v) {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+func ndjsonStripValue(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		ndjsonStripMap(t)
+		return t
+	case []any:
+		return ndjsonStripSlice(t)
+	default:
+		// Includes []byte, which AsRaw returns for a bytes value. That is a
+		// scalar, base64 encoded by encoding/json, and must not be treated as
+		// a container.
+		return v
+	}
+}
+
+// ndjsonIsAbsent reports whether a value carries no information: a null, or a
+// container with nothing in it. A container that arrived empty is dropped just
+// like one the strip emptied.
+//
+// Zero values are information: 0, false and "" all reach the default arm and
+// survive, so the strip can never turn a recorded value into a missing key.
+func ndjsonIsAbsent(v any) bool {
+	switch t := v.(type) {
+	case nil:
+		return true
+	case map[string]any:
+		return len(t) == 0
+	case []any:
+		return len(t) == 0
+	default:
+		return false
+	}
 }
 
 // ndjsonTimestamp renders nanoseconds as a decimal string. OTLP/JSON does the
@@ -176,7 +304,7 @@ func (ndjsonMarshaler) MarshalLogs(ld plog.Logs) ([]byte, error) {
 	enc := newNdjsonEncoder(&buf)
 
 	for _, rl := range ld.ResourceLogs().All() {
-		resourceAttrs := rl.Resource().Attributes().AsRaw()
+		resourceAttrs := ndjsonResourceAttributes(rl.Resource())
 		for _, sl := range rl.ScopeLogs().All() {
 			scopeAttrs := mergeAttributes(resourceAttrs, sl.Scope().Attributes())
 			for _, lr := range sl.LogRecords().All() {
@@ -187,9 +315,12 @@ func (ndjsonMarshaler) MarshalLogs(ld plog.Logs) ([]byte, error) {
 				if ts == 0 {
 					ts = lr.ObservedTimestamp()
 				}
+				message, body, array := ndjsonLogBody(lr.Body())
 				record := ndjsonLogRecord{
 					TimeUnixNano: ndjsonTimestamp(ts),
-					Body:         lr.Body().AsRaw(),
+					Message:      message,
+					Body:         body,
+					Array:        array,
 					Attributes:   mergeAttributes(scopeAttrs, lr.Attributes()),
 				}
 				if err := enc.Encode(record); err != nil {
@@ -206,7 +337,7 @@ func (m ndjsonMarshaler) MarshalMetrics(md pmetric.Metrics) ([]byte, error) {
 	enc := newNdjsonEncoder(&buf)
 
 	for _, rm := range md.ResourceMetrics().All() {
-		resourceAttrs := rm.Resource().Attributes().AsRaw()
+		resourceAttrs := ndjsonResourceAttributes(rm.Resource())
 		for _, sm := range rm.ScopeMetrics().All() {
 			scopeAttrs := mergeAttributes(resourceAttrs, sm.Scope().Attributes())
 			for _, metric := range sm.Metrics().All() {
@@ -419,7 +550,7 @@ func (ndjsonMarshaler) MarshalTraces(td ptrace.Traces) ([]byte, error) {
 	enc := newNdjsonEncoder(&buf)
 
 	for _, rs := range td.ResourceSpans().All() {
-		resourceAttrs := rs.Resource().Attributes().AsRaw()
+		resourceAttrs := ndjsonResourceAttributes(rs.Resource())
 		for _, ss := range rs.ScopeSpans().All() {
 			scopeAttrs := mergeAttributes(resourceAttrs, ss.Scope().Attributes())
 			for _, span := range ss.Spans().All() {
