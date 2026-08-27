@@ -83,7 +83,7 @@ Marshaler determines the format of data sent to AWS S3. Currently, the following
   ```json
   {"timeUnixNano":"1787617744022570766","message":"IngestJob completed","attributes":{"k8s.namespace.name":"simba"}}
   {"timeUnixNano":"1787617744022570766","body":{"reason":"RemovingNode","type":"Normal"},"attributes":{"simba.sh/source":"k8s-events"}}
-  {"name":"container_cpu_usage_seconds_total","type":"sum","timeUnixNano":"1787617817596000000","value":19,"attributes":{"container":"df-ingest"}}
+  {"name":"container_cpu_usage_seconds_total","type":"sum","timeUnixNano":"1787617817596000000","asInt":19,"attributes":{"container":"df-ingest"}}
   {"traceId":"5b8efff798038103d269b633813fc60c","spanId":"eee19b7ec3c1b174","name":"GET /api","kind":"server","status":{"code":"ok"},"attributes":{}}
   ```
 
@@ -109,8 +109,20 @@ Marshaler determines the format of data sent to AWS S3. Currently, the following
   and `""` all remain. If the whole body strips to nothing, no payload field is emitted.
 
   Metric lines carry the metric's `name`, `description`, `unit` and `type` alongside the data point's
-  timestamps, `value` (gauges and sums) or `count`/`sum`/`min`/`max`/`bucketCounts`/`explicitBounds`/`quantileValues`
-  (histograms and summaries). Span lines carry `traceId`, `spanId`, `parentSpanId`, `name`, `kind`, both timestamps
+  timestamps, then either a value field (gauges and sums) or
+  `count`/`sum`/`min`/`max`/`bucketCounts`/`explicitBounds`/`quantileValues` (histograms and summaries).
+
+  A gauge or sum data point names its value field after the value's type, so each key holds one stable JSON type:
+
+  | data point value | field | JSON type |
+  |---|---|---|
+  | int | `asInt` | number |
+  | double | `asDouble` | number |
+  | unset | none — the data point emits no line | — |
+
+  Those two are exhaustive: the OTLP `NumberDataPoint` value is a protobuf oneof with exactly two members, so a data
+  point is a double, an int, or unset. A non-finite double is dropped, data point and all, since a line carrying
+  identity but no reading is noise. Span lines carry `traceId`, `spanId`, `parentSpanId`, `name`, `kind`, both timestamps
   and `status`. Fields that are unset are omitted from the line entirely.
 
   Three things are deliberately not preserved:

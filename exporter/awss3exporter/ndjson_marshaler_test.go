@@ -56,7 +56,7 @@ func TestNdjsonMarshalMetricsSumDataPoint(t *testing.T) {
 	// No "unit" key: the metric does not set one.
 	assert.Equal(t,
 		`{"name":"container_cpu_usage_seconds_total","description":"Cumulative cpu time consumed",`+
-			`"type":"sum","timeUnixNano":"1787617817596000000","value":19,`+
+			`"type":"sum","timeUnixNano":"1787617817596000000","asInt":19,`+
 			`"attributes":{"container":"df-ingest","k8s.cluster.name":"dev-use2-data"}}`+"\n",
 		string(out))
 }
@@ -198,7 +198,7 @@ func TestNdjsonMetricZeroValueRetained(t *testing.T) {
 	require.NoError(t, err)
 	lines := splitLines(t, string(out))
 	require.Len(t, lines, 2)
-	assert.Contains(t, lines[0], `"value":0`)
+	assert.Contains(t, lines[0], `"asInt":0`)
 	assert.Contains(t, lines[1], `"count":0`)
 }
 
@@ -210,10 +210,11 @@ func TestNdjsonMetricIntValueIsJSONNumber(t *testing.T) {
 
 	out, err := ndjsonMarshaler{}.MarshalMetrics(metrics)
 	require.NoError(t, err)
-	assert.Contains(t, string(out), `"value":19`)
-	assert.NotContains(t, string(out), `"value":"19"`)
+	assert.Contains(t, string(out), `"asInt":19`)
+	assert.NotContains(t, string(out), `"asInt":"19"`)
 	// An int must not be rendered through float64 as 19.0 either.
-	assert.NotContains(t, string(out), `"value":19.0`)
+	assert.NotContains(t, string(out), `"asInt":19.0`)
+	assert.NotContains(t, string(out), `"asDouble"`)
 }
 
 func TestNdjsonMetricHistogram(t *testing.T) {
@@ -667,4 +668,59 @@ func TestNdjsonAttributesStripped(t *testing.T) {
 	assert.NotContains(t, attrs, "resource.unset")
 	assert.NotContains(t, attrs, "resource.empty")
 	assert.NotContains(t, attrs, "record.unset")
+}
+
+// TestNdjsonMetricValueTypeRouting pins the value-key contract: an int lands in
+// asInt, a double in asDouble, never both, and an unset data point emits
+// nothing. Those cases are exhaustive over the OTLP value oneof.
+func TestNdjsonMetricValueTypeRouting(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		set     func(pmetric.NumberDataPoint)
+		want    string
+		absent  []string
+		present bool
+	}{
+		{"int", func(dp pmetric.NumberDataPoint) { dp.SetIntValue(19) }, `"asInt":19`, []string{"asDouble"}, true},
+		{"int zero", func(dp pmetric.NumberDataPoint) { dp.SetIntValue(0) }, `"asInt":0`, []string{"asDouble"}, true},
+		{"double", func(dp pmetric.NumberDataPoint) { dp.SetDoubleValue(1.5) }, `"asDouble":1.5`, []string{"asInt"}, true},
+		{"double zero", func(dp pmetric.NumberDataPoint) { dp.SetDoubleValue(0) }, `"asDouble":0`, []string{"asInt"}, true},
+		{"unset", func(pmetric.NumberDataPoint) {}, "", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics := pmetric.NewMetrics()
+			metric := metrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+			metric.SetName("g")
+			tc.set(metric.SetEmptyGauge().DataPoints().AppendEmpty())
+
+			out, err := ndjsonMarshaler{}.MarshalMetrics(metrics)
+			require.NoError(t, err)
+
+			if !tc.present {
+				assert.Empty(t, out, "a data point with no value emits no line")
+				return
+			}
+			assert.Contains(t, string(out), tc.want)
+			for _, k := range tc.absent {
+				assert.NotContains(t, string(out), `"`+k+`"`, "exactly one value key: it is the discriminator")
+			}
+		})
+	}
+}
+
+// TestNdjsonMetricDoubleKeepsFractionalZero guards the pointer choice: a double
+// of 0 must stay in asDouble rather than being dropped by omitempty or
+// collapsing into the integer key.
+func TestNdjsonMetricDoubleKeepsFractionalZero(t *testing.T) {
+	metrics := pmetric.NewMetrics()
+	sm := metrics.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty()
+
+	zero := sm.Metrics().AppendEmpty()
+	zero.SetName("zero_double")
+	zero.SetEmptyGauge().DataPoints().AppendEmpty().SetDoubleValue(0)
+
+	out, err := ndjsonMarshaler{}.MarshalMetrics(metrics)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), `"asDouble":0`)
+	assert.NotContains(t, string(out), `"asInt"`)
 }
