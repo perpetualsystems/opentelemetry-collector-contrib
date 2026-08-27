@@ -25,6 +25,9 @@ subtext: |
   stripped recursively from those fields and from attributes, along with any container left empty by the
   stripping, so a null never appears in a line. Zero values are kept.
 
+  A gauge or sum data point names its value field after the value's type -- `asInt` or `asDouble` -- for the same
+  reason, so a consumer never has to inspect a value to know its type.
+
 # If your change doesn't affect end users or the exported elements of any package,
 # you should instead start your pull request title with [chore] or use the "Skip Changelog" label.
 # Optional: The change log or logs in which this entry should be included.

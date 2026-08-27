@@ -74,8 +74,15 @@ type ndjsonMetricRecord struct {
 	StartTimeUnixNano string `json:"startTimeUnixNano,omitempty"`
 	TimeUnixNano      string `json:"timeUnixNano,omitempty"`
 
-	// Gauge and sum data points.
-	Value any `json:"value,omitempty"`
+	// Gauge and sum data points. The key names the value's type, so each key
+	// holds one stable JSON type and the archive can be read with a fixed
+	// schema, the same contract the log record's message/body/array keys use.
+	//
+	// These two are exhaustive: the NumberDataPoint value is a protobuf oneof
+	// with exactly two members, as_double and as_int, so a data point is a
+	// double, an int, or unset. An unset one emits no line at all.
+	AsDouble *float64 `json:"asDouble,omitempty"`
+	AsInt    *int64   `json:"asInt,omitempty"`
 
 	// Histogram, exponential histogram and summary data points.
 	Count          *uint64   `json:"count,omitempty"`
@@ -404,25 +411,26 @@ func (ndjsonMarshaler) encodeNumberDataPoints(enc *json.Encoder, dps pmetric.Num
 		if dp.Flags().NoRecordedValue() {
 			continue
 		}
-		var value any
+		record := template
 		switch dp.ValueType() {
 		case pmetric.NumberDataPointValueTypeInt:
-			value = dp.IntValue()
+			v := dp.IntValue()
+			record.AsInt = &v
 		case pmetric.NumberDataPointValueTypeDouble:
-			value = ndjsonFloat(dp.DoubleValue())
+			v := dp.DoubleValue()
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				// A non-finite reading. A line carrying identity but no value
+				// is noise, so drop the data point entirely.
+				continue
+			}
+			record.AsDouble = &v
 		default:
-			continue
-		}
-		if value == nil {
-			// A non-finite reading. A line carrying identity but no value is
-			// noise, so drop the data point entirely.
+			// NumberDataPointValueTypeEmpty, and any type pdata adds later.
 			continue
 		}
 
-		record := template
 		record.StartTimeUnixNano = ndjsonTimestamp(dp.StartTimestamp())
 		record.TimeUnixNano = ndjsonTimestamp(dp.Timestamp())
-		record.Value = value
 		record.Attributes = mergeAttributes(scopeAttrs, dp.Attributes())
 
 		if err := enc.Encode(record); err != nil {
